@@ -154,24 +154,6 @@ def save_text(output_dir: str, date_str: str, title: str, content: str) -> str:
 def append_actions(csv_file: str, actions: List[Action]) -> None:
     ensure_dir(os.path.dirname(csv_file) or ".")
 
-    # Backwards-compatible relevance column name
-    def resolve_relevance_field(path: str) -> str:
-        if not os.path.exists(path):
-            return "pesticide_relevant"
-        try:
-            with open(path, newline="", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                header = next(reader, [])
-            if "pesticide_relevant" in header:
-                return "pesticide_relevant"
-            if "immigration_relevant" in header:
-                return "immigration_relevant"
-        except Exception:
-            pass
-        return "pesticide_relevant"
-
-    relevance_field = resolve_relevance_field(csv_file)
-
     fieldnames = [
         "date",
         "title",
@@ -179,7 +161,7 @@ def append_actions(csv_file: str, actions: List[Action]) -> None:
         "types",
         "text_file",
         "description",
-        relevance_field,
+        "pesticide_relevant",
         "full_summary",
     ]
     file_exists = os.path.exists(csv_file)
@@ -190,9 +172,6 @@ def append_actions(csv_file: str, actions: List[Action]) -> None:
         for a in actions:
             row = asdict(a)
             row["types"] = "; ".join(a.types)
-            # Map our in-memory field to the selected CSV column name
-            if relevance_field == "immigration_relevant":
-                row[relevance_field] = row.pop("pesticide_relevant", "")
             writer.writerow(row)
 
 
