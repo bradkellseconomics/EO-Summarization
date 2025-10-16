@@ -31,3 +31,8 @@ Notes
 
 - The tool reads existing URLs from the CSV to avoid duplicates. It stops immediately when it reaches the first previously-scraped URL, after preserving any new items found earlier on that page.
 - API keys are not stored in code; set `OPENAI_API_KEY` in your environment when using `--summarize`.
+
+Summarization focus
+
+- The current prompt assesses whether an action concerns pesticide use (Yes/No/Maybe) and provides a short detailed summary when relevant.
+- If you have an existing CSV created before this change, it may have a column named `immigration_relevant`. The tool will continue writing to that column for backward compatibility; new CSVs will use `pesticide_relevant`.

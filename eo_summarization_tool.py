@@ -32,7 +32,7 @@ class Action:
     types: List[str]
     text_file: str = ""
     description: str = ""
-    immigration_relevant: str = ""
+    pesticide_relevant: str = ""
     full_summary: str = ""
 
 
@@ -153,6 +153,25 @@ def save_text(output_dir: str, date_str: str, title: str, content: str) -> str:
 
 def append_actions(csv_file: str, actions: List[Action]) -> None:
     ensure_dir(os.path.dirname(csv_file) or ".")
+
+    # Backwards-compatible relevance column name
+    def resolve_relevance_field(path: str) -> str:
+        if not os.path.exists(path):
+            return "pesticide_relevant"
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, [])
+            if "pesticide_relevant" in header:
+                return "pesticide_relevant"
+            if "immigration_relevant" in header:
+                return "immigration_relevant"
+        except Exception:
+            pass
+        return "pesticide_relevant"
+
+    relevance_field = resolve_relevance_field(csv_file)
+
     fieldnames = [
         "date",
         "title",
@@ -160,7 +179,7 @@ def append_actions(csv_file: str, actions: List[Action]) -> None:
         "types",
         "text_file",
         "description",
-        "immigration_relevant",
+        relevance_field,
         "full_summary",
     ]
     file_exists = os.path.exists(csv_file)
@@ -171,6 +190,9 @@ def append_actions(csv_file: str, actions: List[Action]) -> None:
         for a in actions:
             row = asdict(a)
             row["types"] = "; ".join(a.types)
+            # Map our in-memory field to the selected CSV column name
+            if relevance_field == "immigration_relevant":
+                row[relevance_field] = row.pop("pesticide_relevant", "")
             writer.writerow(row)
 
 
@@ -196,9 +218,9 @@ def build_openai_client_from_env():
 
 def summarize_action_text(client, text: str, model: str = "gpt-4o", temperature: float = 0.2) -> Tuple[str, str, str]:
     prompt = (
-        "You are a policy analyst. Review the following executive action and answer:\n\n"
+        "You are a policy analyst focusing on pesticide use and regulation. Review the following executive action and answer:\n\n"
         "1. Write a one-sentence summary of what this executive action does.\n"
-        "2. Is this executive action about immigration? Answer Yes, No, or Maybe.\n"
+        "2. Is this executive action about pesticide use? Answer Yes, No, or Maybe.\n"
         "3. If Yes or Maybe, provide a 3-5 sentence summary with additional detail.\n\n"
         "Executive Action:\n"
     )
@@ -217,15 +239,15 @@ def summarize_action_text(client, text: str, model: str = "gpt-4o", temperature:
     lines = [l.strip() for l in gpt_text.split("\n") if l.strip()]
 
     description = lines[0] if lines else ""
-    immigration_relevant = "No"
+    pesticide_relevant = "No"
     full_summary = ""
     for idx, line in enumerate(lines):
         if any(tok in line for tok in ("Yes", "Maybe")):
-            immigration_relevant = line
+            pesticide_relevant = line
             full_summary = " ".join(lines[idx + 1:]).strip()
             break
 
-    return description, immigration_relevant, full_summary
+    return description, pesticide_relevant, full_summary
 
 
 # ------------------------------ Orchestration ------------------------------
@@ -257,9 +279,9 @@ def process_page(
 
         if client is not None and content and content != "[no content]":
             try:
-                desc, imm_rel, full = summarize_action_text(client, content, model=model)
+                desc, pest_rel, full = summarize_action_text(client, content, model=model)
                 a.description = desc
-                a.immigration_relevant = imm_rel
+                a.pesticide_relevant = pest_rel
                 a.full_summary = full
             except Exception as e:
                 logging.warning("Summarization failed for %s: %s", a.url, e)
