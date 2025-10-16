@@ -1,0 +1,20 @@
+# Secrets and environment
+.env
+.env.*
+!.env.example
+
+# Notebook containing sensitive API key
+EO Summarization Tool 07_02_25.ipynb
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Tool outputs
+whitehouse_texts/
+whitehouse_presidential_actions.csv
