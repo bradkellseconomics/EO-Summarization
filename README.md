@@ -35,4 +35,3 @@ Notes
 Summarization focus
 
 - The current prompt assesses whether an action concerns pesticide use (Yes/No/Maybe) and provides a short detailed summary when relevant.
-- If you have an existing CSV created before this change, it may have a column named `immigration_relevant`. The tool will continue writing to that column for backward compatibility; new CSVs will use `pesticide_relevant`.
