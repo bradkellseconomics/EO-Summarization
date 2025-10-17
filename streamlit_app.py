@@ -1,9 +1,12 @@
 import os
 import csv
-from typing import List
+import re
+from collections import Counter
+from typing import List, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
+import eo_summarization_tool as tool
 
 
 DEFAULT_CSV = "whitehouse_presidential_actions.csv"
@@ -27,6 +30,7 @@ def load_data(csv_path: str) -> pd.DataFrame:
         "types",
         "text_file",
         "description",
+        "relevance_topic",
         "full_summary",
     ]:
         if col not in df.columns:
@@ -107,6 +111,103 @@ def sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
+def discover_topic_csvs(base_csv: str) -> List[Tuple[str, str]]:
+    """Find CSVs alongside base_csv and label them by topic.
+
+    Returns a list of (label, path). Label prefers the CSV's 'relevance_topic' values
+    (most frequent non-empty), then filename pattern '<root> - <Topic>.csv', else basename.
+    The base CSV (no topic suffix) is listed first, then others alphabetically by label.
+    """
+    directory = os.path.dirname(base_csv) or "."
+    base = os.path.basename(base_csv)
+    root, ext = os.path.splitext(base)
+    if not ext:
+        ext = ".csv"
+
+    candidates: List[Tuple[str, str]] = []
+    try:
+        names = [n for n in os.listdir(directory) if n.lower().endswith(".csv")]
+    except Exception:
+        names = []
+
+    for name in names:
+        if not (name == f"{root}{ext}" or name.startswith(f"{root} - ")):
+            continue
+        path = os.path.join(directory, name)
+        label: Optional[str] = None
+        # Try reading a small sample to detect the topic
+        try:
+            df_head = pd.read_csv(path, nrows=200)
+            if "relevance_topic" in df_head.columns:
+                topics = [str(v).strip() for v in df_head["relevance_topic"].dropna().tolist() if str(v).strip()]
+                if topics:
+                    label = Counter(topics).most_common(1)[0][0]
+        except Exception:
+            pass
+
+        if not label:
+            m = re.match(rf"^{re.escape(root)} - (.+)\.csv$", name, flags=re.IGNORECASE)
+            if m:
+                label = m.group(1)
+
+        if not label:
+            label = name
+
+        candidates.append((label, path))
+
+    # Sort: base first, then others by label
+    base_first: List[Tuple[str, str]] = []
+    others: List[Tuple[str, str]] = []
+    for label, path in candidates:
+        if os.path.basename(path).lower() == f"{root}{ext}".lower():
+            base_first.append((label, path))
+        else:
+            others.append((label, path))
+    others.sort(key=lambda x: x[0].lower())
+    return base_first + others
+
+
+def run_tools_ui(base_csv: str) -> Optional[str]:
+    st.sidebar.header("Run Tools")
+    topic = st.sidebar.text_input("Relevance Topic (optional)", value="")
+    base_csv_input = st.sidebar.text_input("Base CSV path", value=base_csv)
+    topic_csv = tool.topic_csv_path(base_csv_input, topic or None)
+    st.sidebar.caption(f"Output CSV: {topic_csv}")
+
+    start_page = st.sidebar.number_input("Start page", min_value=1, value=1, step=1)
+    lookback_days = st.sidebar.number_input("Lookback days", min_value=0, value=15, step=1,
+                                            help="0 means no lookback cutoff")
+    max_pages = st.sidebar.number_input("Max pages (0 = unlimited)", min_value=0, value=0, step=1)
+    delay = st.sidebar.number_input("Delay between pages (s)", min_value=0.0, value=1.0, step=0.5)
+    summarize = st.sidebar.checkbox("Summarize with OpenAI", value=True)
+    update_missing = st.sidebar.checkbox("Update missing summaries in CSV", value=False)
+    model = st.sidebar.text_input("OpenAI model", value="gpt-4o")
+
+    if st.sidebar.button("Run scrape/update"):
+        with st.status("Running scrape/update...", expanded=True) as status:
+            try:
+                tool.run(
+                    output_dir="whitehouse_texts",
+                    csv_file=topic_csv,
+                    start_page=int(start_page),
+                    max_pages=None if int(max_pages) == 0 else int(max_pages),
+                    delay=float(delay),
+                    test_single_page=False,
+                    summarize=bool(summarize),
+                    model=model,
+                    lookback_days=None if int(lookback_days) == 0 else int(lookback_days),
+                    update_missing=bool(update_missing),
+                    relevance_topic=(topic or None),
+                )
+                status.update(label="Completed", state="complete")
+                st.success(f"Wrote updates to {topic_csv}")
+                return topic_csv
+            except Exception as e:
+                status.update(label="Failed", state="error")
+                st.error(f"Run failed: {e}")
+    return None
+
+
 def render_kpis(df: pd.DataFrame):
     total = len(df)
     rel_yes = (df["relevance"] == "Yes").sum()
@@ -178,7 +279,28 @@ def main():
     st.title("Executive Actions Summaries")
     st.caption("Dashboard for scraped Presidential actions and GPT summaries")
 
-    csv_path = st.sidebar.text_input("CSV path", value=DEFAULT_CSV)
+    # Allow running tools and deriving topic-specific CSV paths
+    updated_csv = run_tools_ui(DEFAULT_CSV)
+    # Discover available topic CSVs and select by label (topic)
+    csv_options = discover_topic_csvs(DEFAULT_CSV)
+    label_to_path = {label: path for label, path in csv_options}
+    labels = [label for label, _ in csv_options]
+
+    default_index = 0
+    if updated_csv and labels:
+        for i, (label, path) in enumerate(csv_options):
+            if path == updated_csv:
+                default_index = i
+                break
+
+    selected_label = None
+    if labels:
+        selected_label = st.sidebar.selectbox("Available CSVs (by topic)", labels, index=default_index)
+        csv_path = label_to_path[selected_label]
+    else:
+        st.sidebar.info("No topic CSVs found. Run a scrape to create one.")
+        csv_path = DEFAULT_CSV
+
     df = load_data(csv_path)
     if df.empty:
         st.stop()
