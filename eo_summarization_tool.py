@@ -5,7 +5,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Tuple, Optional, Dict
 
 try:
@@ -32,7 +32,8 @@ class Action:
     types: List[str]
     text_file: str = ""
     description: str = ""
-    pesticide_relevant: str = ""
+    relevance_topic: str = ""
+    relevant_eo: str = ""
     full_summary: str = ""
 
 
@@ -153,7 +154,6 @@ def save_text(output_dir: str, date_str: str, title: str, content: str) -> str:
 
 def append_actions(csv_file: str, actions: List[Action]) -> None:
     ensure_dir(os.path.dirname(csv_file) or ".")
-
     fieldnames = [
         "date",
         "title",
@@ -161,10 +161,12 @@ def append_actions(csv_file: str, actions: List[Action]) -> None:
         "types",
         "text_file",
         "description",
-        "pesticide_relevant",
+        "relevance_topic",
+        "relevant_eo",
         "full_summary",
     ]
     file_exists = os.path.exists(csv_file)
+
     with open(csv_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
@@ -195,12 +197,26 @@ def build_openai_client_from_env():
     return OpenAI(api_key=api_key)
 
 
-def summarize_action_text(client, text: str, model: str = "gpt-4o", temperature: float = 0.2) -> Tuple[str, str, str]:
+def summarize_action_text(
+    client,
+    text: str,
+    model: str = "gpt-4o",
+    temperature: float = 0.2,
+    relevance_topic: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    scope_line = ""
+    if relevance_topic:
+        topic = relevance_topic.strip()
+        scope_line = (
+            f"Relevance scope: {topic}. Mark 'Relevant' only if the action materially concerns {topic} (not just tangential mentions).\n"
+        )
     prompt = (
-        "You are a policy analyst focusing on pesticide use and regulation. Review the following executive action and answer:\n\n"
-        "1. Write a one-sentence summary of what this executive action does.\n"
-        "2. Is this executive action about pesticide use? Answer Yes, No, or Maybe.\n"
-        "3. If Yes or Maybe, provide a 3-5 sentence summary with additional detail.\n\n"
+        "You are a policy analyst reviewing U.S. Presidential actions. Read the text and answer.\n"
+        + scope_line +
+        "\nRespond in exactly three labeled lines, without numbering, like:\n"
+        "Summary: <one sentence>\n"
+        "Relevant: <Yes|No|Maybe>\n"
+        "Details: <3-5 sentences if Relevant is Yes or Maybe; otherwise leave blank>\n\n"
         "Executive Action:\n"
     )
 
@@ -215,18 +231,62 @@ def summarize_action_text(client, text: str, model: str = "gpt-4o", temperature:
         temperature=temperature,
     )
     gpt_text = (resp.choices[0].message.content or "").strip()
+
+    def _strip_prefix(s: str) -> str:
+        return re.sub(r"^\s*(?:\d+[\.)]\s*|[-*]\s*)?(?:Summary|Relevant|Relevance|Details?):?\s*", "", s, flags=re.IGNORECASE).strip()
+
+    def _extract_relevance_from_labeled(s: str) -> Optional[str]:
+        m = re.search(r"\b(Yes|No|Maybe)\b", s, flags=re.IGNORECASE)
+        return m.group(1).capitalize() if m else None
+
     lines = [l.strip() for l in gpt_text.split("\n") if l.strip()]
 
-    description = lines[0] if lines else ""
-    pesticide_relevant = "No"
-    full_summary = ""
+    desc, rel, details = "", "No", ""
+    labeled_found = False
     for idx, line in enumerate(lines):
-        if any(tok in line for tok in ("Yes", "Maybe")):
-            pesticide_relevant = line
-            full_summary = " ".join(lines[idx + 1:]).strip()
-            break
+        if re.match(r"(?i)^\s*summary\s*:\s*", line):
+            desc = _strip_prefix(line)
+            labeled_found = True
+        elif re.match(r"(?i)^\s*(?:relevant|relevance)\s*:\s*", line):
+            r = _extract_relevance_from_labeled(line)
+            if r:
+                rel = r
+            labeled_found = True
+        elif re.match(r"(?i)^\s*details?\s*:\s*", line):
+            details = _strip_prefix(line)
+            if idx + 1 < len(lines):
+                tail = " ".join(_strip_prefix(l) for l in lines[idx + 1:]).strip()
+                if tail:
+                    details = (details + " " + tail).strip() if details else tail
+            labeled_found = True
 
-    return description, pesticide_relevant, full_summary
+    if not labeled_found:
+        # Fallback: summary from first line; relevance from a clean answer line
+        desc = _strip_prefix(lines[0]) if lines else ""
+        rel_line_idx = None
+        answer_pattern = re.compile(r"^\s*(?:\d+[\.)]\s*)?(?:[-*]\s*)?(?:relevant|relevance)?[:\-\s]*\s*(Yes|No|Maybe)\b", re.IGNORECASE)
+        for idx, line in enumerate(lines):
+            m = answer_pattern.match(line)
+            if m:
+                rel = m.group(1).capitalize()
+                rel_line_idx = idx
+                break
+        if rel_line_idx is not None and rel in ("Yes", "Maybe"):
+            details = " ".join(_strip_prefix(l) for l in lines[rel_line_idx + 1:]).strip()
+
+    if rel not in ("Yes", "Maybe"):
+        details = ""
+
+    return desc, rel, details
+
+
+def summarize_with_fallback(client, text: str, model: str, relevance_topic: Optional[str]) -> Tuple[str, str, str]:
+    """Try summarization with the requested model, then fall back to gpt-4o-mini."""
+    try:
+        return summarize_action_text(client, text, model=model, relevance_topic=relevance_topic)
+    except Exception as e:
+        logging.warning("Primary model '%s' failed: %s. Falling back to 'gpt-4o-mini'", model, e)
+        return summarize_action_text(client, text, model="gpt-4o-mini", relevance_topic=relevance_topic)
 
 
 # ------------------------------ Orchestration ------------------------------
@@ -238,7 +298,9 @@ def process_page(
     output_dir: str,
     client=None,
     model: str = "gpt-4o",
-) -> Tuple[List[Action], bool]:
+    cutoff_date: Optional[datetime] = None,
+    relevance_topic: Optional[str] = None,
+) -> Tuple[List[Action], bool, bool]:
     """Process a listing page.
 
     Returns (results, known_encountered). Stops at the first known URL,
@@ -247,27 +309,42 @@ def process_page(
     actions = fetch_actions_page(page_num)
     results: List[Action] = []
     known_encountered = False
+    cutoff_encountered = False
 
     for a in actions:
         if a.url in known_urls:
             known_encountered = True
             break
 
+        # Respect lookback window: stop when encountering an action older than cutoff
+        if cutoff_date is not None:
+            a_date = parse_date_maybe(a.date)
+            if a_date is not None and a_date < cutoff_date:
+                cutoff_encountered = True
+                break
+
         content = fetch_action_content(a.url)
         a.text_file = save_text(output_dir, a.date, a.title, content)
 
         if client is not None and content and content != "[no content]":
             try:
-                desc, pest_rel, full = summarize_action_text(client, content, model=model)
+                logging.debug("Summarizing URL=%s model=%s content_len=%d", a.url, model, len(content))
+                _t0 = time.perf_counter()
+                desc, pest_rel, full = summarize_with_fallback(client, content, model=model, relevance_topic=relevance_topic)
+                _dt = time.perf_counter() - _t0
                 a.description = desc
-                a.pesticide_relevant = pest_rel
+                a.relevance_topic = relevance_topic or ""
+                a.relevant_eo = pest_rel
                 a.full_summary = full
+                logging.info("Summarized: '%s' [relevance=%s, %.2fs]", a.title, pest_rel or "", _dt)
+                if desc:
+                    logging.debug("Summary preview: %s", desc[:140])
             except Exception as e:
                 logging.warning("Summarization failed for %s: %s", a.url, e)
 
         results.append(a)
 
-    return results, known_encountered
+    return results, known_encountered, cutoff_encountered
 
 
 def run(
@@ -279,6 +356,9 @@ def run(
     test_single_page: bool,
     summarize: bool,
     model: str,
+    lookback_days: Optional[int],
+    update_missing: bool = False,
+    relevance_topic: Optional[str] = None,
 ):
     known_urls, latest = load_known_urls(csv_file)
     if latest:
@@ -287,20 +367,35 @@ def run(
         logging.info("Known URLs: %d", len(known_urls))
 
     client = None
-    if summarize:
-        client = build_openai_client_from_env()
+    if summarize or update_missing:
+        try:
+            client = build_openai_client_from_env()
+            logging.info("OpenAI client initialized; summarization enabled (summarize=%s, update_missing=%s)", summarize, update_missing)
+        except Exception as e:
+            logging.warning("Summarization disabled: %s", e)
+            client = None
+            summarize = False
+            update_missing = False
 
     all_actions: List[Action] = []
     page = start_page
     pages_processed = 0
-    # Stop immediately once a known URL is encountered
-    
+    # Determine cutoff date if a lookback window is set
+    cutoff_date: Optional[datetime] = None
+    if lookback_days is not None and lookback_days > 0:
+        cutoff_date = datetime.utcnow() - timedelta(days=lookback_days)
+        logging.info("Applying lookback window: last %d days (cutoff %s)", lookback_days, cutoff_date.strftime("%Y-%m-%d"))
+
     while True:
-        page_results, known_hit = process_page(page, known_urls, output_dir, client=client, model=model)
+        page_results, known_hit, cutoff_hit = process_page(
+            page, known_urls, output_dir, client=client, model=model, cutoff_date=cutoff_date, relevance_topic=relevance_topic
+        )
         if page_results:
             all_actions.extend(page_results)
         # If we encountered a known URL on this page, we're caught up — stop now.
         if known_hit:
+            break
+        if cutoff_hit:
             break
         # If the page produced no results (empty listing or errors), stop.
         if not page_results:
@@ -318,6 +413,116 @@ def run(
     if all_actions:
         append_actions(csv_file, all_actions)
 
+    # Optionally backfill missing summaries in existing CSV rows
+    if update_missing:
+        updated = update_missing_summaries(csv_file, output_dir, client, model=model, delay=delay)
+        logging.info("Updated missing summaries: %d rows", updated)
+
+
+def update_missing_summaries(
+    csv_file: str,
+    output_dir: str,
+    client,
+    model: str = "gpt-4o",
+    delay: float = 0.0,
+    relevance_topic: Optional[str] = None,
+) -> int:
+    """Scan CSV for rows missing summaries and fill them in.
+
+    Returns the count of rows updated.
+    """
+    if not os.path.exists(csv_file):
+        logging.info("CSV file not found: %s", csv_file)
+        return 0
+
+    try:
+        with open(csv_file, newline="", encoding="utf-8") as f:
+            rows: List[Dict[str, str]] = list(csv.DictReader(f))
+    except Exception as e:
+        logging.warning("Could not read CSV %s: %s", csv_file, e)
+        return 0
+
+    if not rows:
+        return 0
+
+    fieldnames = [
+        "date",
+        "title",
+        "url",
+        "types",
+        "text_file",
+        "description",
+        "relevance_topic",
+        "relevant_eo",
+        "full_summary",
+    ]
+
+    updated_count = 0
+    for r in rows:
+        desc = (r.get("description") or "").strip()
+        pest = (r.get("relevant_eo") or "").strip()
+        full = (r.get("full_summary") or "").strip()
+        if desc and pest:
+            continue  # already summarized
+
+        # Obtain content from saved text file or by fetching
+        content: str = ""
+        text_path = (r.get("text_file") or "").strip()
+        if text_path and os.path.exists(text_path):
+            try:
+                with open(text_path, "r", encoding="utf-8") as tf:
+                    content = tf.read()
+            except Exception as e:
+                logging.debug("Failed reading text file %s: %s", text_path, e)
+
+        if not content:
+            url = (r.get("url") or "").strip()
+            if not url:
+                continue
+            content = fetch_action_content(url)
+            # Cache content to a file for future runs
+            date_str = r.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
+            title = r.get("title") or "untitled"
+            text_path = save_text(output_dir, date_str, title, content)
+            r["text_file"] = text_path
+
+        try:
+            logging.debug("Backfill summarize URL=%s model=%s content_len=%d", r.get("url"), model, len(content))
+            _t0 = time.perf_counter()
+            desc, pest_rel, full = summarize_with_fallback(client, content, model=model, relevance_topic=relevance_topic)
+            _dt = time.perf_counter() - _t0
+            r["description"] = desc
+            r["relevance_topic"] = relevance_topic or r.get("relevance_topic") or ""
+            r["relevant_eo"] = pest_rel
+            r["full_summary"] = full
+            updated_count += 1
+            logging.info("Backfilled summary for title='%s' [relevance=%s, %.2fs]", (r.get("title") or ""), pest_rel or "", _dt)
+            if desc:
+                logging.debug("Backfill summary preview: %s", desc[:140])
+            if delay:
+                time.sleep(delay)
+        except Exception as e:
+            logging.warning("Summarization failed during update for URL %s: %s", r.get("url"), e)
+
+    # Rewrite CSV with updated rows
+    tmp_path = csv_file + ".tmp"
+    try:
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+        os.replace(tmp_path, csv_file)
+    except Exception as e:
+        logging.warning("Failed writing updated CSV %s: %s", csv_file, e)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return updated_count
+
 
 # ------------------------------- CLI --------------------------------
 
@@ -330,13 +535,19 @@ def main():
     parser.add_argument("--max-pages", type=int, default=None, help="Max number of pages to scrape (None=until stop)")
     parser.add_argument("--delay", type=float, default=1.0, help="Delay between page requests (seconds)")
     parser.add_argument("--single-page", action="store_true", help="Scrape only a single page and exit")
-    parser.add_argument("--summarize", action="store_true", help="Enable OpenAI summarization (requires OPENAI_API_KEY)")
+    parser.add_argument("--summarize", action="store_true", help="Enable OpenAI summarization (default enabled if API key present)")
+    parser.add_argument("--no-summarize", action="store_true", help="Disable OpenAI summarization")
     parser.add_argument("--model", default="gpt-4o", help="OpenAI model for summarization")
+    parser.add_argument("--lookback-days", type=int, default=15, help="Only include actions from the last N days (default: 60)")
+    parser.add_argument("--update-missing-summaries", action="store_true", help="Scan CSV and summarize rows missing summaries")
+    parser.add_argument("--relevance-topic", default="", help="Topic to evaluate relevance against (e.g., 'Immigration', 'Pesticide', 'Education')")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
 
     setup_logging(args.verbose)
+    # Summarization is enabled by default unless explicitly disabled
+    summarize_flag = not args.no_summarize
     run(
         output_dir=args.output_dir,
         csv_file=args.csv_file,
@@ -344,8 +555,11 @@ def main():
         max_pages=args.max_pages,
         delay=args.delay,
         test_single_page=args.single_page,
-        summarize=args.summarize,
+        summarize=summarize_flag,
         model=args.model,
+        lookback_days=args.lookback_days,
+        update_missing=args.update_missing_summaries,
+        relevance_topic=(args.relevance_topic or None),
     )
 
 

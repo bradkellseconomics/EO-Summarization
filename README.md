@@ -34,4 +34,4 @@ Notes
 
 Summarization focus
 
-- The current prompt assesses whether an action concerns pesticide use (Yes/No/Maybe) and provides a short detailed summary when relevant.
+- The prompt asks for a one‑sentence summary and whether the action is relevant to the analysis scope (Yes/No/Maybe). If Yes/Maybe, it includes a short detailed summary.
