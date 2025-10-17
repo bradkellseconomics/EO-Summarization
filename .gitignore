@@ -18,3 +18,5 @@ __pycache__/
 # Tool outputs
 whitehouse_texts/
 whitehouse_presidential_actions.csv
+# Ignore topic-suffixed CSV outputs as well
+whitehouse_presidential_actions - *.csv
