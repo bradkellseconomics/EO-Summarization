@@ -64,6 +64,25 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def topic_csv_path(base_csv: str, relevance_topic: Optional[str]) -> str:
+    """Derive a topic-specific CSV path by inserting the topic before the extension.
+
+    Examples:
+      base_csv = "whitehouse_presidential_actions.csv", topic "Immigration" ->
+      "whitehouse_presidential_actions - Immigration.csv"
+    """
+    if not relevance_topic:
+        return base_csv
+    directory = os.path.dirname(base_csv)
+    base = os.path.basename(base_csv)
+    root, ext = os.path.splitext(base)
+    if not ext:
+        ext = ".csv"
+    topic_part = safe_filename(relevance_topic.strip(), 80)
+    filename = f"{root} - {topic_part}{ext}"
+    return os.path.join(directory or ".", filename)
+
+
 # ----------------------------- Scraping -----------------------------
 
 
@@ -548,9 +567,14 @@ def main():
     setup_logging(args.verbose)
     # Summarization is enabled by default unless explicitly disabled
     summarize_flag = not args.no_summarize
+    # If a relevance topic is provided, write to a topic-specific CSV
+    topic_aware_csv = topic_csv_path(args.csv_file, args.relevance_topic or None)
+    if args.relevance_topic:
+        logging.info("Using topic-specific CSV: %s", topic_aware_csv)
+
     run(
         output_dir=args.output_dir,
-        csv_file=args.csv_file,
+        csv_file=topic_aware_csv,
         start_page=args.start_page,
         max_pages=args.max_pages,
         delay=args.delay,
