@@ -1,3 +1,9 @@
+EO Summarization Toolkit
+
+This repo has two parts:
+- Daily Scheduled EO Reviewer (CLI/scraper) → see docs/scraper.md
+- Streamlit Dashboard (visualize and explore) → see docs/streamlit.md
+
 EO Summarization CLI
 
 This script scrapes recent items from the White House Presidential Actions pages, saves the page text to files, and optionally summarizes each item with an OpenAI model. Results are appended to a CSV.
@@ -35,3 +41,19 @@ Notes
 Summarization focus
 
 - The prompt asks for a one‑sentence summary and whether the action is relevant to the analysis scope (Yes/No/Maybe). If Yes/Maybe, it includes a short detailed summary.
+
+
+Scheduled Execution (Windows)
+
+- Use `run_scraper.bat` as a portable launcher for daily scraping/summarization via Task Scheduler.
+- To override interpreter paths or include machine-specific logic, create `run_scraper.local.bat` in the repo folder. It is gitignored and called by `run_scraper.bat` if present.
+- `run_scraper.bat` behavior:
+  - Runs from its own directory so relative paths resolve.
+  - Honors `PYTHON_EXE` if set; otherwise prefers `.venv\\Scripts\\python.exe`, then `py -3`, then `python`.
+  - Exits with the Python process code. The script prints a completion message and pauses when run interactively.
+
+Task Scheduler quick setup
+
+- Action: Start a program → Program/script: `run_scraper.bat`
+- Start in: leave blank (the batch changes to its own folder)
+- If Python is not on PATH, either set a user/system env var `PYTHON_EXE` to your interpreter or create a local `.venv` and install `requirements.txt`.
